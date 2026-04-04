@@ -292,6 +292,36 @@ export class ChatGPTAgent {
       }
     }
 
+    // Fallback: detect "filename.ext" on its own line followed by a code block
+    if (!writes.length) {
+      const fallbackRegex = new RegExp("^([\\w./\\\\-]+\\.[\\w]{1,10})\\s*\n```(?:\\w*)\n([\\s\\S]*?)```", "gm");
+      let fm;
+      while ((fm = fallbackRegex.exec(text)) !== null) {
+        const tag = fm[1].trim();
+        const content = fm[2];
+        if (langTags.has(tag.toLowerCase())) continue;
+        if (content.trim().length > 5) {
+          writes.push({ path: tag, content });
+        }
+      }
+    }
+
+    // Fallback 2: if task mentions a specific file and response has one big code block, assume it is that file
+    if (!writes.length) {
+      const singleBlockRegex = new RegExp("```(?:markdown|md|json|ts|js|html|css)?\n([\\s\\S]{50,}?)```");
+      const singleBlock = text.match(singleBlockRegex);
+      if (singleBlock) {
+        const beforeBlock = text.slice(0, text.indexOf(singleBlock[0]));
+        const fileRef = beforeBlock.match(/([\w./\\-]+\.[\w]{1,10})/g);
+        if (fileRef) {
+          const lastFile = fileRef[fileRef.length - 1];
+          if (!langTags.has(lastFile.toLowerCase()) && lastFile.includes(".")) {
+            writes.push({ path: lastFile, content: singleBlock[1] });
+          }
+        }
+      }
+    }
+
     return writes;
   }
 
