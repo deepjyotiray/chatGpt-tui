@@ -117,6 +117,7 @@ export class ChatGPTAgent {
     // Agent tool loop
     const toolLog: string[] = [];
     let turnCount = 0;
+    let nudgeCount = 0;
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const action = tryParseAction(result.raw!);
