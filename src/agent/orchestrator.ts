@@ -3,8 +3,8 @@ import { LocalToolRegistry } from "./tools.js";
 import { MemoryStore } from "./memory.js";
 import { loadProjectContext } from "./project-context.js";
 
-const MAX_ITERATIONS = 20;
-const MAX_CONTEXT_CHARS = 30000;
+const MAX_ROUNDS = 10;
+const MAX_CONTEXT_CHARS = 40000;
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
 
@@ -14,15 +14,13 @@ export interface AgentEvent {
 }
 export type AgentEventCallback = (event: AgentEvent) => void;
 
-interface OllamaMessage { role: "system" | "user" | "assistant"; content: string; }
-
 /**
  * Two-brain orchestrator:
- *   Brain 1 (Ollama) = planner/router — runs the agent loop, outputs JSON tool calls
- *   Brain 2 (ChatGPT) = expert coder — called only for heavy coding/writing tasks
+ *   ChatGPT = thinker/planner/coder (smart, natural language)
+ *   Ollama  = JSON extractor (converts ChatGPT's words into tool calls)
  */
 export class ChatGPTAgent {
-  private chatgptSessions = new Map<string, PlannerSession>();
+  private sessions = new Map<string, PlannerSession>();
 
   constructor(
     private readonly chatgpt: PlannerAdapter,
@@ -31,232 +29,226 @@ export class ChatGPTAgent {
     private readonly onEvent?: AgentEventCallback
   ) {}
 
-  setRoot(newRoot: string): void { this.root = newRoot; }
-  resetSession(conversationId?: string): void {
-    if (conversationId) this.chatgptSessions.delete(conversationId);
-    else this.chatgptSessions.clear();
+  setRoot(r: string): void { this.root = r; }
+  resetSession(id?: string): void {
+    if (id) this.sessions.delete(id); else this.sessions.clear();
   }
 
-  async run(userMessage: string, conversationId: string = "default"): Promise<string> {
-    this.emit({ type: "init", data: "Planning with local LLM…" });
+  async run(userMessage: string, conversationId = "default"): Promise<string> {
+    // Get or create ChatGPT session
+    let session = this.sessions.get(conversationId);
+    const isFirst = !session;
+    if (!session) {
+      this.emit({ type: "init", data: "Starting session…" });
+      session = await this.chatgpt.startSession();
+      this.sessions.set(conversationId, session);
+    }
 
-    // Build context
-    const projectCtx = await loadProjectContext(this.root);
-    const memoryCtx = await new MemoryStore(this.root).buildContextBlock();
-    const fileTree = await this.getFileTree();
+    // Build ChatGPT prompt
+    const prompt = await this.buildChatGPTPrompt(userMessage, isFirst);
+    this.emit({ type: "thinking", data: { message: userMessage } });
 
-    const systemPrompt = [
-      "You are a coding agent planner. You control tools to accomplish tasks.",
-      "Reply with EXACTLY ONE JSON object per message. No other text.",
-      "",
-      "Available actions:",
-      '  {"action":"read_file","args":{"path":"..."},"reason":"why"}',
-      '  {"action":"read_multiple_files","args":{"paths":["...","..."]},"reason":"why"}',
-      '  {"action":"search","args":{"pattern":"..."},"reason":"why"}',
-      '  {"action":"list_files","args":{"path":".","maxDepth":2},"reason":"why"}',
-      '  {"action":"write_file","args":{"path":"...","content":"..."},"reason":"why"}',
-      '  {"action":"run_command","args":{"command":"..."},"reason":"why"}',
-      '  {"action":"ask_expert","args":{"task":"what you need","context":"relevant file contents"},"reason":"why"}',
-      '  {"action":"done","result":"final answer in markdown"}',
-      "",
-      "RULES:",
-      "- ALWAYS read files before modifying them.",
-      "- Use ask_expert when you need to generate complex code, rewrite large files, or need creative/architectural thinking.",
-      "- For ask_expert, include ALL relevant file contents in the context field so the expert has everything needed.",
-      "- After ask_expert returns, use write_file to save the result.",
-      "- Break tasks into steps: discover → read → plan → ask_expert (if needed) → write → verify.",
-      "- For simple tasks (rename, small edits), do them directly without ask_expert.",
-      "- The reason field should explain your thinking at each step.",
-      "",
-      `WORKSPACE: ${this.root}`,
-      fileTree ? `\nFILES:\n${fileTree}` : "",
-      projectCtx ? `\n${projectCtx.slice(0, 1500)}` : "",
-      memoryCtx ? `\n${memoryCtx.slice(0, 1500)}` : "",
-    ].filter(Boolean).join("\n");
-
-    // Ollama conversation history for this run
-    const messages: OllamaMessage[] = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: `TASK: ${userMessage}` }
-    ];
+    // Send to ChatGPT
+    let chatResponse = await this.chatgpt.sendTurn(session, prompt);
+    if (!chatResponse.ok || !chatResponse.raw) {
+      // Retry with fresh session
+      this.sessions.delete(conversationId);
+      session = await this.chatgpt.startSession();
+      this.sessions.set(conversationId, session);
+      chatResponse = await this.chatgpt.sendTurn(session, prompt);
+      if (!chatResponse.ok || !chatResponse.raw) return `⚠️ ${chatResponse.message}`;
+    }
 
     const toolLog: string[] = [];
 
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
-      // Call Ollama (Brain 1)
-      this.emit({ type: "thinking", data: { step: i + 1 } });
-      const ollamaResponse = await this.callOllama(messages);
+    // Back-and-forth loop
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      // Ask Ollama to extract actions from ChatGPT's response
+      const actions = await this.extractActions(chatResponse.raw!, userMessage);
 
-      if (!ollamaResponse) {
-        if (toolLog.length) return toolLog.join("\n\n") + "\n\n⚠️ Planner returned empty response.";
-        return "⚠️ Local planner returned empty response. Is Ollama running?";
+      // If Ollama says "done" or found no actions, ChatGPT's response IS the answer
+      if (!actions.length || (actions.length === 1 && actions[0].action === "done")) {
+        const answer = actions[0]?.result ?? chatResponse.raw!;
+        if (toolLog.length) return toolLog.join("\n\n") + "\n\n" + answer;
+        return answer;
       }
 
-      messages.push({ role: "assistant", content: ollamaResponse });
+      // Execute each action
+      const results: string[] = [];
+      let wroteFiles = false;
 
-      // Parse the action
-      const action = this.parseAction(ollamaResponse);
-      if (!action) {
-        // Plain text — might be the answer itself
-        if (toolLog.length) return toolLog.join("\n\n") + "\n\n" + ollamaResponse;
-        return ollamaResponse;
-      }
+      for (const action of actions) {
+        if (action.action === "done") continue;
 
-      // Done
-      if (action.action === "done") {
-        const answer = (action.result as string) ?? (action.message as string) ?? "";
-        this.emit({ type: "answer", data: answer });
-        return toolLog.length ? toolLog.join("\n\n") + "\n\n" + answer : answer;
-      }
+        const toolName = action.action;
+        const toolArgs = action.args ?? {};
+        const reason = action.reason ?? toolName;
 
-      // Ask expert (Brain 2 — ChatGPT)
-      if (action.action === "ask_expert") {
-        const task = (action.args as any)?.task ?? userMessage;
-        const context = (action.args as any)?.context ?? "";
-        const reason = (action.reason as string) ?? "Consulting expert";
+        this.emit({ type: "step", data: { step: `💡 ${reason}` } });
+        this.emit({ type: "tool_call", data: { tool: toolName, reason } });
 
-        this.emit({ type: "step", data: { step: `🧠 Asking ChatGPT: ${reason}` } });
-        this.emit({ type: "tool_call", data: { tool: "ask_expert", reason } });
+        const toolResult = await this.tools.execute(toolName as any, toolArgs, {
+          root: this.root, safetyMode: "auto", task: this.makeDummyTask(),
+          saveCheckpoint: async () => "", loadCheckpoint: async () => ({} as any)
+        });
 
-        const expertResponse = await this.askChatGPT(task, context, conversationId);
-        toolLog.push(`🧠 **Expert consulted** — ${reason}`);
+        this.emit({ type: "tool_result", data: { tool: toolName, ok: toolResult.ok, message: toolResult.message } });
 
-        messages.push({ role: "user", content: `EXPERT_RESULT: ${expertResponse.slice(0, 10000)}` });
-        continue;
-      }
+        // Build log entry
+        let detail = `${toolResult.ok ? "✅" : "❌"} **${toolName}**${reason !== toolName ? ` — ${reason}` : ""}: ${toolResult.message}`;
 
-      // Regular tool call
-      const toolName = action.action;
-      const toolArgs = (action.args as Record<string, unknown>) ?? {};
-      const reason = (action.reason as string) ?? "";
-
-      this.emit({ type: "step", data: { step: `💡 ${reason || toolName}` } });
-      this.emit({ type: "tool_call", data: { tool: toolName, args: toolArgs, reason } });
-
-      const toolResult = await this.tools.execute(toolName as any, toolArgs, {
-        root: this.root, safetyMode: "auto", task: this.makeDummyTask(),
-        saveCheckpoint: async () => "", loadCheckpoint: async () => ({} as any)
-      });
-
-      this.emit({ type: "tool_result", data: { tool: toolName, ok: toolResult.ok, message: toolResult.message } });
-
-      // Build display log
-      let detail = `${toolResult.ok ? "✅" : "❌"} **${toolName}**${reason ? ` — ${reason}` : ""}: ${toolResult.message}`;
-
-      // Show diff for writes
-      if (toolResult.ok && ["write_file", "apply_patch", "replace_text", "insert_text"].includes(toolName)) {
-        const filePath = (toolArgs.path as string) ?? "";
-        if (filePath) {
-          const diff = await this.tools.execute("git_diff" as any, { path: filePath }, {
-            root: this.root, safetyMode: "auto", task: this.makeDummyTask(),
-            saveCheckpoint: async () => "", loadCheckpoint: async () => ({} as any)
-          });
-          const diffText = (diff.data as any)?.stdout ?? "";
-          if (diffText.trim()) detail += `\n\n\`\`\`diff\n${diffText.slice(0, 3000)}\n\`\`\``;
+        // Diff for writes
+        if (toolResult.ok && ["write_file", "apply_patch", "replace_text"].includes(toolName)) {
+          wroteFiles = true;
+          const fp = (toolArgs as any).path ?? "";
+          if (fp) {
+            const diff = await this.tools.execute("git_diff" as any, { path: fp }, {
+              root: this.root, safetyMode: "auto", task: this.makeDummyTask(),
+              saveCheckpoint: async () => "", loadCheckpoint: async () => ({} as any)
+            });
+            const d = (diff.data as any)?.stdout ?? "";
+            if (d.trim()) detail += `\n\n\`\`\`diff\n${d.slice(0, 3000)}\n\`\`\``;
+          }
         }
+
+        // Command output
+        if (toolResult.ok && ["run_command", "run_tests", "run_build"].includes(toolName)) {
+          const out = ((toolResult.data as any)?.stdout ?? "") + ((toolResult.data as any)?.stderr ?? "");
+          if (out.trim()) detail += `\n\n\`\`\`\n${out.trim().slice(0, 2000)}\n\`\`\``;
+        }
+
+        toolLog.push(detail);
+
+        // Collect results to send back to ChatGPT
+        const resultSummary = toolResult.ok
+          ? `${toolName} succeeded: ${toolResult.message}\n${safeStringify(toolResult.data, 4000)}`
+          : `${toolName} failed: ${toolResult.message}`;
+        results.push(resultSummary);
       }
 
-      // Show command output
-      if (toolResult.ok && ["run_command", "run_tests", "run_build"].includes(toolName)) {
-        const output = ((toolResult.data as any)?.stdout ?? "") + ((toolResult.data as any)?.stderr ?? "");
-        if (output.trim()) detail += `\n\n\`\`\`\n${output.trim().slice(0, 2000)}\n\`\`\``;
+      // If we wrote files, we're probably done
+      if (wroteFiles) {
+        return toolLog.join("\n\n") + "\n\n✅ Changes applied.";
       }
 
-      toolLog.push(detail);
+      // Send results back to ChatGPT for next round
+      const followUp = [
+        "Here are the results of the actions you requested:\n",
+        ...results.map((r, i) => `${i + 1}. ${r}`),
+        "\nNow continue with the task. If you need to write/update files, provide the complete file content. If you're done, give your final answer."
+      ].join("\n");
 
-      // Feed result back to Ollama
-      const resultStr = safeStringify({ ok: toolResult.ok, message: toolResult.message, data: toolResult.data }, 6000);
-      messages.push({ role: "user", content: `TOOL_RESULT: ${resultStr}` });
-
-      // Trim conversation if too long
-      if (JSON.stringify(messages).length > MAX_CONTEXT_CHARS) {
-        // Keep system + last 6 messages
-        const system = messages[0];
-        messages.splice(0, messages.length);
-        messages.push(system, ...messages.slice(-6));
+      chatResponse = await this.chatgpt.sendTurn(session, followUp);
+      if (!chatResponse.ok || !chatResponse.raw) {
+        if (toolLog.length) return toolLog.join("\n\n") + "\n\n✅ Task completed.";
+        return `⚠️ ${chatResponse.message}`;
       }
     }
 
-    return toolLog.join("\n\n") + "\n\n⚠️ Reached max iterations.";
+    return toolLog.join("\n\n") + "\n\n⚠️ Reached max rounds.";
   }
 
-  private async callOllama(messages: OllamaMessage[]): Promise<string | null> {
+  /**
+   * Ask Ollama to extract structured actions from ChatGPT's natural language response.
+   * Ollama is great at this — it's a simple extraction task.
+   */
+  private async extractActions(chatgptResponse: string, originalTask: string): Promise<any[]> {
+    const extractPrompt = [
+      "Extract tool actions from the following AI response. Output a JSON array of actions.",
+      "Each action: {\"action\":\"<tool>\",\"args\":{...},\"reason\":\"short reason\"}",
+      "",
+      "Available tools: read_file, read_multiple_files, write_file, search, list_files, run_command, git_diff, git_status",
+      "",
+      "Rules:",
+      "- If the response contains a complete file to write, extract it as write_file with the full content.",
+      "- If the response asks to read/inspect files, extract as read_file.",
+      "- If the response asks to run a command, extract as run_command.",
+      "- If the response is a final answer with no actions needed, return: [{\"action\":\"done\",\"result\":\"the answer\"}]",
+      "- If the response contains code blocks with file paths (like ```README.md), extract as write_file.",
+      "- Output ONLY the JSON array. No other text.",
+      "",
+      `Original task: ${originalTask}`,
+      "",
+      "AI Response to extract from:",
+      chatgptResponse.slice(0, 8000)
+    ].join("\n");
+
     try {
       const res = await fetch(`${OLLAMA_URL}/api/chat`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           model: OLLAMA_MODEL,
-          messages,
+          messages: [{ role: "user", content: extractPrompt }],
           stream: false,
-          options: { temperature: 0.1, num_predict: 4096 }
+          options: { temperature: 0, num_predict: 4096 }
         }),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(30000)
       });
-      if (!res.ok) return null;
+
+      if (!res.ok) return [];
       const body = await res.json() as { message?: { content?: string } };
-      return body.message?.content?.trim() ?? null;
+      const raw = body.message?.content?.trim() ?? "";
+
+      // Parse the JSON array
+      let text = raw;
+      const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+      if (fenced) text = fenced[1].trim();
+
+      try {
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed)) return parsed.filter(a => a && typeof a.action === "string");
+        if (parsed && typeof parsed.action === "string") return [parsed];
+      } catch {}
+
+      // Try to find array in text
+      const arrMatch = text.match(/\[[\s\S]*\]/);
+      if (arrMatch) {
+        try {
+          const parsed = JSON.parse(arrMatch[0]);
+          if (Array.isArray(parsed)) return parsed.filter(a => a && typeof a.action === "string");
+        } catch {}
+      }
+
+      return [];
     } catch {
-      return null;
+      return [];
     }
   }
 
-  private async askChatGPT(task: string, context: string, conversationId: string): Promise<string> {
-    // Get or create a ChatGPT session for this conversation
-    let session = this.chatgptSessions.get(conversationId);
-    if (!session) {
-      session = await this.chatgpt.startSession();
-      this.chatgptSessions.set(conversationId, session);
+  private async buildChatGPTPrompt(userMessage: string, isFirst: boolean): Promise<string> {
+    const parts: string[] = [];
+
+    if (isFirst) {
+      const projectCtx = await loadProjectContext(this.root);
+      const memoryCtx = await new MemoryStore(this.root).buildContextBlock();
+      const fileTree = await this.getFileTree();
+
+      parts.push("You are a coding assistant working on a project. I can execute file operations and commands for you.");
+      parts.push("");
+      parts.push("When you need to:");
+      parts.push("- Read a file: say \"I need to read path/to/file\"");
+      parts.push("- Write a file: output the COMPLETE content in a code block tagged with the file path:");
+      parts.push("  ```path/to/file.md");
+      parts.push("  full content here");
+      parts.push("  ```");
+      parts.push("- Run a command: say \"Run: `command`\"");
+      parts.push("- Search: say \"Search for: pattern\"");
+      parts.push("");
+      parts.push("Be direct. Don't ask permission. Just tell me what you need or provide the file content.");
+      parts.push("For file updates, ALWAYS provide the COMPLETE file, not just the changed parts.");
+      parts.push("");
+      parts.push(`Workspace: ${this.root}`);
+      if (fileTree) parts.push(`\nFiles:\n${fileTree}`);
+      if (projectCtx) parts.push(`\n${projectCtx.slice(0, 1500)}`);
+      if (memoryCtx) parts.push(`\n${memoryCtx.slice(0, 1500)}`);
     }
 
-    const prompt = [
-      "You are an expert coder. Complete the following task.",
-      "Output the complete result directly. No explanations unless asked.",
-      "If writing a file, output the FULL file content.",
-      "",
-      context ? `CONTEXT:\n${context.slice(0, 15000)}` : "",
-      "",
-      `TASK: ${task}`
-    ].filter(Boolean).join("\n");
+    parts.push(`\n${userMessage}`);
 
-    const result = await this.chatgpt.sendTurn(session, prompt);
-    return result.raw ?? result.message ?? "Expert returned no response.";
-  }
-
-  private parseAction(raw: string): any {
-    let text = raw.trim();
-    // Strip code fences
-    const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
-    if (fenced) text = fenced[1].trim();
-
-    // Direct parse
-    try {
-      const p = JSON.parse(text);
-      if (p && typeof p.action === "string") return p;
-    } catch {}
-
-    // Fix broken JSON (newlines in strings)
-    try {
-      const fixed = text.replace(/[\n\r\t]/g, (c) => c === "\n" ? "\\n" : c === "\r" ? "" : "\\t");
-      const p = JSON.parse(fixed);
-      if (p && typeof p.action === "string") return p;
-    } catch {}
-
-    // Extract from surrounding text
-    const match = text.match(/\{[\s\S]*"action"\s*:\s*"[^"]+[\s\S]*\}/);
-    if (match) {
-      try {
-        const p = JSON.parse(match[0]);
-        if (p && typeof p.action === "string") return p;
-      } catch {}
-      try {
-        const fixed = match[0].replace(/[\n\r\t]/g, (c) => c === "\n" ? "\\n" : c === "\r" ? "" : "\\t");
-        const p = JSON.parse(fixed);
-        if (p && typeof p.action === "string") return p;
-      } catch {}
-    }
-
-    return null;
+    let prompt = parts.join("\n");
+    if (prompt.length > MAX_CONTEXT_CHARS) prompt = prompt.slice(0, MAX_CONTEXT_CHARS) + "\n...[truncated]";
+    return prompt;
   }
 
   private async getFileTree(): Promise<string> {
