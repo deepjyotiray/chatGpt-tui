@@ -438,6 +438,7 @@ function relayReadBody(req) {
 
 // --- App lifecycle ---
 app.whenReady().then(() => {
+  require("events").EventEmitter.defaultMaxListeners = 30;
   buildMenu();
   createWindow();
   relayServer.listen(BRIDGE_RELAY_PORT, "127.0.0.1", () => {
