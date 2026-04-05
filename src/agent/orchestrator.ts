@@ -1,7 +1,12 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import type { PlannerAdapter, PlannerSession } from "./types.js";
 import { LocalToolRegistry } from "./tools.js";
 import { MemoryStore } from "./memory.js";
 import { loadProjectContext } from "./project-context.js";
+
+const MAX_ROUNDS = 5;
+const MAX_PROMPT_CHARS = 35000;
 
 export interface AgentEvent {
   type: "init" | "thinking" | "tool_call" | "tool_result" | "answer" | "error" | "step";
@@ -9,18 +14,9 @@ export interface AgentEvent {
 }
 export type AgentEventCallback = (event: AgentEvent) => void;
 
-/**
- * Our code drives the loop. ChatGPT is just a function we call.
- * 
- * Flow:
- *   1. Our code analyzes the task and gathers relevant files
- *   2. One ChatGPT call with everything it needs
- *   3. Our code extracts code blocks and writes them
- *   4. Our code verifies (diff, tests)
- *   5. If verification fails, one more ChatGPT call to fix
- */
 export class ChatGPTAgent {
   private sessions = new Map<string, PlannerSession>();
+  private systemPrompt: string | null = null;
 
   constructor(
     private readonly chatgpt: PlannerAdapter,
@@ -29,43 +25,137 @@ export class ChatGPTAgent {
     private readonly onEvent?: AgentEventCallback
   ) {}
 
-  setRoot(r: string): void { this.root = r; }
+  setRoot(r: string): void { this.root = r; this.systemPrompt = null; }
   resetSession(id?: string): void {
     if (id) this.sessions.delete(id); else this.sessions.clear();
+  }
+
+  private async getSystemPrompt(): Promise<string> {
+    if (this.systemPrompt) return this.systemPrompt;
+    try {
+      // Look for AGENT_SYSTEM.md in the project root first, then in the app directory
+      for (const loc of [path.join(this.root, "AGENT_SYSTEM.md"), path.resolve("AGENT_SYSTEM.md")]) {
+        try {
+          this.systemPrompt = await fs.readFile(loc, "utf8");
+          return this.systemPrompt;
+        } catch {}
+      }
+    } catch {}
+    this.systemPrompt = "You are a coding agent. Use PATCH blocks for edits, CREATE blocks for new files.";
+    return this.systemPrompt;
   }
 
   async run(userMessage: string, conversationId = "default"): Promise<string> {
     const log: string[] = [];
 
-    // Step 1: Gather context — OUR CODE decides what to read
-    this.emit({ type: "init", data: "Analyzing task…" });
+    // Step 1: Gather context
+    this.emit({ type: "init", data: "Gathering context…" });
     const context = await this.gatherContext(userMessage, log);
 
-    // Step 2: Call ChatGPT with focused context
+    // Step 2: Build prompt with system instructions + context + task
+    const system = await this.getSystemPrompt();
+    const prompt = [system, "", context, "", `TASK: ${userMessage}`].join("\n").slice(0, MAX_PROMPT_CHARS);
+
+    // Step 3: Send to ChatGPT
     this.emit({ type: "step", data: { step: "🧠 Asking ChatGPT…" } });
     const session = await this.getSession(conversationId);
-    const prompt = this.buildPrompt(userMessage, context);
+    let response = await this.send(session, prompt, conversationId);
+    if (!response) return log.join("\n\n") + "\n\n⚠️ No response from ChatGPT.";
 
-    console.log("[agent] Prompt length:", prompt.length);
-    const response = await this.chatgpt.sendTurn(session, prompt);
+    // Step 4: Parse and execute actions — multi-round if NEED requests
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const actions = this.parseActions(response);
 
-    if (!response.ok || !response.raw) {
-      // Retry with fresh session
-      this.sessions.delete(conversationId);
-      const fresh = await this.getSession(conversationId);
-      const retry = await this.chatgpt.sendTurn(fresh, prompt);
-      if (!retry.ok || !retry.raw) {
-        return log.length ? log.join("\n\n") + `\n\n⚠️ ${retry.message}` : `⚠️ ${retry.message}`;
+      if (!actions.length) {
+        // Pure text answer
+        return log.length ? log.join("\n\n") + "\n\n" + response : response;
       }
-      return this.processResponse(retry.raw, userMessage, conversationId, log);
+
+      let needsFollowUp = false;
+      const followUpParts: string[] = [];
+
+      for (const action of actions) {
+        switch (action.type) {
+          case "patch": {
+            this.emit({ type: "tool_call", data: { tool: "replace_text", reason: `Patching ${action.path}` } });
+            const result = await this.exec("replace_text", {
+              path: action.path,
+              oldText: action.before,
+              newText: action.after
+            });
+            if (result.ok) {
+              log.push(`✅ Patched \`${action.path}\``);
+              const diff = await this.exec("git_diff", { path: action.path });
+              const d = (diff.data as any)?.stdout ?? "";
+              if (d.trim()) log.push("```diff\n" + d.slice(0, 3000) + "\n```");
+            } else {
+              log.push(`❌ Patch failed on \`${action.path}\`: ${result.message}`);
+              followUpParts.push(`PATCH FAILED on ${action.path}: ${result.message}. The exact BEFORE text was not found. Please re-read the file and try again.`);
+              needsFollowUp = true;
+            }
+            break;
+          }
+          case "create": {
+            this.emit({ type: "tool_call", data: { tool: "write_file", reason: `Creating ${action.path}` } });
+            const result = await this.exec("write_file", { path: action.path, content: action.content });
+            if (result.ok) {
+              log.push(`✅ Created \`${action.path}\``);
+            } else {
+              log.push(`❌ Failed to create \`${action.path}\`: ${result.message}`);
+            }
+            break;
+          }
+          case "need": {
+            this.emit({ type: "tool_call", data: { tool: "read_file", reason: `Reading ${action.path}` } });
+            const result = await this.exec("read_file", { path: action.path });
+            if (result.ok) {
+              const content = (result.data as any)?.content ?? "";
+              followUpParts.push(`--- ${action.path} ---\n${content.slice(0, 8000)}`);
+              log.push(`📖 Read \`${action.path}\``);
+            } else {
+              followUpParts.push(`Could not read ${action.path}: ${result.message}`);
+              log.push(`❌ Could not read \`${action.path}\``);
+            }
+            needsFollowUp = true;
+            break;
+          }
+          case "run": {
+            this.emit({ type: "tool_call", data: { tool: "run_command", reason: action.command } });
+            const result = await this.exec("run_command", { command: action.command });
+            const out = ((result.data as any)?.stdout ?? "") + ((result.data as any)?.stderr ?? "");
+            log.push(`🔧 \`${action.command}\`\n\`\`\`\n${out.trim().slice(0, 2000)}\n\`\`\``);
+            if (!result.ok) {
+              followUpParts.push(`Command failed: ${action.command}\nOutput:\n${out.slice(0, 3000)}`);
+              needsFollowUp = true;
+            }
+            break;
+          }
+          case "search": {
+            this.emit({ type: "tool_call", data: { tool: "search", reason: action.query } });
+            const result = await this.exec("search", { pattern: action.query });
+            const out = (result.data as any)?.stdout ?? "";
+            followUpParts.push(`Search results for "${action.query}":\n${out.slice(0, 3000)}`);
+            log.push(`🔍 Searched \`${action.query}\``);
+            needsFollowUp = true;
+            break;
+          }
+        }
+      }
+
+      if (!needsFollowUp) break;
+
+      // Send follow-up to ChatGPT with results
+      this.emit({ type: "step", data: { step: "🧠 Sending results to ChatGPT…" } });
+      const followUp = followUpParts.join("\n\n") + "\n\nContinue with the task.";
+      response = await this.send(session, followUp, conversationId);
+      if (!response) break;
     }
 
-    return this.processResponse(response.raw, userMessage, conversationId, log);
+    return log.length ? log.join("\n\n") : "Done.";
   }
 
-  /**
-   * Step 1: Our code gathers all relevant context before calling ChatGPT.
-   */
+  // --- Context gathering ---
+
   private async gatherContext(task: string, log: string[]): Promise<string> {
     const parts: string[] = [];
 
@@ -84,31 +174,15 @@ export class ChatGPTAgent {
     if (files.length) parts.push("PROJECT FILES:\n" + files.slice(0, 100).join("\n"));
     log.push(`📂 Scanned ${files.length} files`);
 
-    // Find relevant files based on the task
-    const relevant = this.findRelevantFiles(task, files);
-    
     // Read relevant files
-    for (const f of relevant.slice(0, 6)) {
+    const relevant = this.findRelevantFiles(task, files);
+    for (const f of relevant.slice(0, 5)) {
       this.emit({ type: "tool_call", data: { tool: "read_file", reason: `Reading ${f}` } });
       const result = await this.exec("read_file", { path: f });
       if (result.ok) {
         const content = (result.data as any)?.content ?? "";
         parts.push(`--- ${f} ---\n${content.slice(0, 5000)}`);
         log.push(`📖 Read \`${f}\``);
-      }
-    }
-
-    // Search for task-related patterns if needed
-    const searchTerms = this.extractSearchTerms(task);
-    for (const term of searchTerms.slice(0, 2)) {
-      this.emit({ type: "tool_call", data: { tool: "search", reason: `Searching: ${term}` } });
-      const result = await this.exec("search", { pattern: term });
-      if (result.ok) {
-        const output = (result.data as any)?.stdout ?? "";
-        if (output.trim()) {
-          parts.push(`SEARCH "${term}":\n${output.slice(0, 2000)}`);
-          log.push(`🔍 Searched \`${term}\``);
-        }
       }
     }
 
@@ -122,216 +196,109 @@ export class ChatGPTAgent {
     return parts.join("\n\n");
   }
 
-  /**
-   * Step 2: Build the ChatGPT prompt — context + task + output instructions.
-   */
-  private buildPrompt(task: string, context: string): string {
-    return [
-      "You are a coding assistant. I've gathered the project context for you below.",
-      "",
-      "INSTRUCTIONS:",
-      "- Complete the task directly.",
-      "- When writing/updating a file, output the COMPLETE file content in a code block tagged with the file path:",
-      "  ```path/to/file.ext",
-      "  complete file content here",
-      "  ```",
-      "- You can output multiple files if needed.",
-      "- Be concise in explanations. Focus on the code.",
-      "",
-      `WORKSPACE: ${this.root}`,
-      "",
-      context,
-      "",
-      `TASK: ${task}`
-    ].join("\n").slice(0, 40000);
+  // --- Action parsing ---
+
+  private parseActions(text: string): Array<{type: string; path?: string; before?: string; after?: string; content?: string; command?: string; query?: string}> {
+    const actions: Array<any> = [];
+
+    // PATCH: path\n<<<<<<< BEFORE\n...\n=======\n...\n>>>>>>> AFTER
+    const patchRegex = /PATCH:\s*([\w./\\-]+\.[\w]{1,10})\s*\n<<<<<<< BEFORE\n([\s\S]*?)\n=======\n([\s\S]*?)\n>>>>>>> AFTER/g;
+    let m;
+    while ((m = patchRegex.exec(text)) !== null) {
+      actions.push({ type: "patch", path: m[1].trim(), before: m[2], after: m[3] });
+    }
+
+    // CREATE: path\n...\nEND_CREATE
+    const createRegex = /CREATE:\s*([\w./\\-]+\.[\w]{1,10})\s*\n([\s\S]*?)\nEND_CREATE/g;
+    while ((m = createRegex.exec(text)) !== null) {
+      actions.push({ type: "create", path: m[1].trim(), content: m[2] });
+    }
+
+    // NEED: path
+    const needRegex = /NEED:\s*([\w./\\-]+\.[\w]{1,10})/g;
+    while ((m = needRegex.exec(text)) !== null) {
+      actions.push({ type: "need", path: m[1].trim() });
+    }
+
+    // RUN: command
+    const runRegex = /RUN:\s*(.+)/g;
+    while ((m = runRegex.exec(text)) !== null) {
+      const cmd = m[1].trim().replace(/^`|`$/g, "");
+      if (cmd.length > 2) actions.push({ type: "run", command: cmd });
+    }
+
+    // SEARCH: pattern
+    const searchRegex = /SEARCH:\s*(.+)/g;
+    while ((m = searchRegex.exec(text)) !== null) {
+      const q = m[1].trim();
+      if (q.length > 1) actions.push({ type: "search", query: q });
+    }
+
+    return actions;
   }
 
-  /**
-   * Step 3: Process ChatGPT's response — extract code blocks, write files, verify.
-   */
-  private async processResponse(response: string, task: string, conversationId: string, log: string[]): Promise<string> {
-    console.log("[agent] Response length:", response.length);
+  // --- Helpers ---
 
-    // Extract code blocks with file paths
-    const writes = this.extractFileWrites(response);
-
-    if (!writes.length) {
-      // No files to write — this is just an answer
-      return log.length ? log.join("\n\n") + "\n\n" + response : response;
-    }
-
-    // Write each file
-    for (const { path, content } of writes) {
-      this.emit({ type: "step", data: { step: `✍️ Writing ${path}` } });
-      this.emit({ type: "tool_call", data: { tool: "write_file", reason: `Writing ${path}` } });
-      const result = await this.exec("write_file", { path, content });
-
-      if (result.ok) {
-        log.push(`✅ Wrote \`${path}\``);
-
-        // Get diff
-        const diff = await this.exec("git_diff", { path });
-        const diffText = (diff.data as any)?.stdout ?? "";
-        if (diffText.trim()) {
-          log.push(`\`\`\`diff\n${diffText.slice(0, 3000)}\n\`\`\``);
-        }
-      } else {
-        log.push(`❌ Failed to write \`${path}\`: ${result.message}`);
-      }
-    }
-
-    // Strip the code blocks from the response to get just the explanation
-    let explanation = response;
-    for (const { path } of writes) {
-      // Remove the code block for this file from the explanation
-      const regex = new RegExp("```" + path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\n[\\s\\S]*?```", "g");
-      explanation = explanation.replace(regex, "").trim();
-    }
-
-    // Combine log + explanation
-    const finalParts = [...log];
-    if (explanation.trim()) finalParts.push(explanation);
-    return finalParts.join("\n\n");
-  }
-
-  /**
-   * Find files relevant to the task based on keywords.
-   */
   private findRelevantFiles(task: string, allFiles: string[]): string[] {
     const lower = task.toLowerCase();
     const relevant: string[] = [];
 
-    // Direct file mentions in the task
+    // Direct file mentions
     for (const f of allFiles) {
       const name = f.split("/").pop()?.toLowerCase() ?? "";
-      if (lower.includes(name.replace(/\.\w+$/, "")) && name.includes(".")) {
+      if (name.includes(".") && lower.includes(name.replace(/\.\w+$/, ""))) {
         relevant.push(f);
       }
     }
 
-    // Keyword-based matching
-    const keywords: Record<string, string[]> = {
-      "readme": ["README.md", "readme.md"],
-      "package": ["package.json"],
-      "config": ["tsconfig.json", ".chatgpt-agent.json"],
-      "coupon": ["public/coupons.json"],
-      "test": ["package.json"],
-      "style": ["app/renderer/styles.css"],
-      "html": ["app/renderer/index.html"],
-      "electron": ["app/main.cjs", "app/preload.cjs", "app/chatgpt-bridge.cjs"],
-      "agent": ["src/agent/orchestrator.ts", "src/agent/runtime.ts", "AGENT.md"],
-      "bridge": ["src/bridge-server.ts", "app/chatgpt-bridge.cjs"],
-      "api": ["src/api-server.ts"],
-      "memory": ["src/agent/memory.ts"],
-      "tool": ["src/agent/tools.ts"],
-      "type": ["src/agent/types.ts"],
+    // Keyword matching
+    const map: Record<string, string[]> = {
+      readme: ["README.md"], package: ["package.json"], config: ["tsconfig.json"],
+      coupon: ["public/coupons.json"], electron: ["app/main.cjs", "app/preload.cjs"],
+      agent: ["src/agent/orchestrator.ts", "AGENT.md"], bridge: ["src/bridge-server.ts", "app/chatgpt-bridge.cjs"],
+      api: ["src/api-server.ts"], memory: ["src/agent/memory.ts"], tool: ["src/agent/tools.ts"],
+      style: ["app/renderer/styles.css"], html: ["app/renderer/index.html"],
     };
-
-    for (const [keyword, files] of Object.entries(keywords)) {
-      if (lower.includes(keyword)) {
+    for (const [kw, files] of Object.entries(map)) {
+      if (lower.includes(kw)) {
         for (const f of files) {
           if (allFiles.includes(f) && !relevant.includes(f)) relevant.push(f);
         }
       }
     }
 
-    // Always include package.json for context
-    if (!relevant.includes("package.json") && allFiles.includes("package.json")) {
-      relevant.push("package.json");
-    }
-
+    if (!relevant.includes("package.json") && allFiles.includes("package.json")) relevant.push("package.json");
     return relevant;
   }
 
-  /**
-   * Extract search terms from the task for grep.
-   */
   private extractSearchTerms(task: string): string[] {
     const terms: string[] = [];
-    // Look for quoted strings
     const quoted = task.match(/"([^"]+)"|'([^']+)'/g);
-    if (quoted) {
-      for (const q of quoted) terms.push(q.replace(/['"]/g, ""));
-    }
-    // Look for specific identifiers (camelCase, snake_case)
-    const identifiers = task.match(/\b[a-z]+(?:[A-Z][a-z]+)+\b|\b[a-z]+(?:_[a-z]+)+\b/g);
-    if (identifiers) {
-      for (const id of identifiers.slice(0, 2)) terms.push(id);
-    }
+    if (quoted) for (const q of quoted) terms.push(q.replace(/['"]/g, ""));
     return terms;
   }
 
-  /**
-   * Extract file writes from ChatGPT's response.
-   * Looks for code blocks tagged with file paths: ```path/to/file.ext
-   */
-  private extractFileWrites(text: string): Array<{ path: string; content: string }> {
-    const writes: Array<{ path: string; content: string }> = [];
-    const regex = /```([\w./\\-]+\.[\w]{1,10})\n([\s\S]*?)```/g;
-    const langTags = new Set([
-      "json", "bash", "sh", "diff", "text", "txt", "md", "markdown",
-      "javascript", "typescript", "ts", "js", "html", "css", "python",
-      "py", "yaml", "yml", "xml", "sql", "plaintext", "shell", "zsh",
-      "toml", "ini", "env", "log", "csv", "jsx", "tsx", "scss", "less",
-      "rust", "go", "java", "c", "cpp", "ruby", "php", "swift", "kotlin"
-    ]);
-
-    let m;
-    while ((m = regex.exec(text)) !== null) {
-      const tag = m[1];
-      const content = m[2];
-
-      // Skip if it's just a language tag, not a file path
-      if (langTags.has(tag.toLowerCase())) continue;
-
-      // Must look like a file path (has / or starts with known dir or has extension with path-like chars)
-      if (!tag.includes("/") && !tag.startsWith(".") && !tag.match(/^[\w-]+\.[\w]+$/)) continue;
-
-      if (content.trim().length > 5) {
-        writes.push({ path: tag, content });
-      }
+  private async send(session: PlannerSession, prompt: string, conversationId: string): Promise<string | null> {
+    const result = await this.chatgpt.sendTurn(session, prompt);
+    if (result.ok && result.raw) {
+      console.log("[chatgpt]", result.raw.slice(0, 150));
+      return result.raw;
     }
-
-    // Fallback: detect "filename.ext" on its own line followed by a code block
-    if (!writes.length) {
-      const fallbackRegex = new RegExp("^([\\w./\\\\-]+\\.[\\w]{1,10})\\s*\n```(?:\\w*)\n([\\s\\S]*?)```", "gm");
-      let fm;
-      while ((fm = fallbackRegex.exec(text)) !== null) {
-        const tag = fm[1].trim();
-        const content = fm[2];
-        if (langTags.has(tag.toLowerCase())) continue;
-        if (content.trim().length > 5) {
-          writes.push({ path: tag, content });
-        }
-      }
+    // Retry with fresh session
+    this.sessions.delete(conversationId);
+    const fresh = await this.getSession(conversationId);
+    const retry = await this.chatgpt.sendTurn(fresh, prompt);
+    if (retry.ok && retry.raw) {
+      console.log("[chatgpt] retry:", retry.raw.slice(0, 150));
+      return retry.raw;
     }
-
-    // Fallback 2: if task mentions a specific file and response has one big code block, assume it is that file
-    if (!writes.length) {
-      const singleBlockRegex = new RegExp("```(?:markdown|md|json|ts|js|html|css)?\n([\\s\\S]{50,}?)```");
-      const singleBlock = text.match(singleBlockRegex);
-      if (singleBlock) {
-        const beforeBlock = text.slice(0, text.indexOf(singleBlock[0]));
-        const fileRef = beforeBlock.match(/([\w./\\-]+\.[\w]{1,10})/g);
-        if (fileRef) {
-          const lastFile = fileRef[fileRef.length - 1];
-          if (!langTags.has(lastFile.toLowerCase()) && lastFile.includes(".")) {
-            writes.push({ path: lastFile, content: singleBlock[1] });
-          }
-        }
-      }
-    }
-
-    return writes;
+    return null;
   }
 
   private async getSession(conversationId: string): Promise<PlannerSession> {
-    let session = this.sessions.get(conversationId);
-    if (!session) {
-      session = await this.chatgpt.startSession();
-      this.sessions.set(conversationId, session);
-    }
-    return session;
+    let s = this.sessions.get(conversationId);
+    if (!s) { s = await this.chatgpt.startSession(); this.sessions.set(conversationId, s); }
+    return s;
   }
 
   private async exec(tool: string, args: Record<string, unknown>) {
